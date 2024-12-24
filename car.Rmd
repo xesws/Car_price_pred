@@ -1,0 +1,229 @@
+---
+title: "car"
+output: html_document
+date: "2023-11-16"
+---
+
+```{r setup, error=TRUE}
+install.packages("caret")
+install.packages("glmnet")
+install.packages("keras")
+```
+
+```{r, error=TRUE}
+library(xgboost)
+library(dplyr)
+library(tidyverse)
+library(randomForest)
+library(caret)
+library(glmnet)
+library(keras)
+```
+
+
+```{r, error=TRUE}
+setwd("/Users/tq/Downloads/car_price")
+```
+
+
+```{r, error=TRUE}
+data <- read_csv("analysisData.csv")
+scoring_data <- read.csv("scoringData.csv")
+bar <- nrow(data)
+nrow(data)
+nrow(scoring_data)
+whole <- rbind(data%>%select(-price), scoring_data)
+
+##pre-processing
+colSums(is.na(whole))
+# Function to calculate mode
+getmode <- function(v) {
+   uniqv <- unique(na.omit(v))
+   uniqv[which.max(tabulate(match(v, uniqv)))]
+}
+# Loop through each column
+for (col in names(whole)) {
+  # Check if the column is numeric
+  if (is.numeric(whole[[col]])) {
+    # Replace NA with mean
+    whole[[col]][is.na(data[[col]])] <- mean(whole[[col]], na.rm = TRUE)
+  }
+  # Check if the column is a factor
+  else if (is.factor(whole[[col]])) {
+    # Replace NA with mode
+    mode_value <- getmode(whole[[col]])
+    whole[[col]][is.na(whole[[col]])] <- mode_value
+  }else if (lubridate::is.Date(whole[[col]])) {
+    # Replace Date with meaningful numeric features
+    # For example, extract year, month, and day
+    whole[paste0(col, "_year")] <- lubridate::year(whole[[col]])
+    whole[paste0(col, "_month")] <- lubridate::month(whole[[col]])
+    whole[paste0(col, "_day")] <- lubridate::day(whole[[col]])
+    # Remove original date column
+    whole[[col]] <- NULL
+}}
+whole <- whole[, sapply(whole, function(x) !is.character(x))]
+data2 <- whole[seq(1,bar,1),]
+data2
+scoring_data <- whole[seq(bar+1, 50000, 1),]
+scoring_data
+
+numeric_columns <- sapply(data2, is.numeric)
+correlations <- sapply(data2[, numeric_columns], function(x) cor(x, data$price))
+
+# Select features with a significant correlation
+# Adjust the threshold as necessary
+selected_features <- names(correlations[abs(correlations) > 0.1])
+
+selected_features <- c(selected_features, names(data2)[sapply(data2, is.factor)])
+selected_features_scoring <- c(selected_features, names(data2)[sapply(scoring_data, is.factor)])
+
+data_selected <- data2[, selected_features]
+scoring_data_selected <- scoring_data[, selected_features_scoring]
+target <- data$price
+```
+
+
+```{r}
+
+# Split data into training and test sets
+set.seed(123)
+train_index <- sample(1:nrow(data2), 0.8 * nrow(data2))
+train_data <- data2[train_index, ]%>%select(-id)
+test_data <- data2[-train_index, ]%>%select(-id)
+
+# Prepare matrices for XGBoost
+dtrain <- xgb.DMatrix(data = as.matrix(train_data), label = target[train_index])
+dtest <- xgb.DMatrix(data = as.matrix(test_data), label = target[-train_index])
+
+params <- list(
+  booster = "gbtree",
+  objective = "reg:squarederror",
+  eta = 0.3,
+  max_depth = 5,
+  min_child_weight = 1,
+  subsample = 1,
+  colsample_bytree = 1
+)
+
+nrounds <- 1000
+model <- xgb.train(params = params, data = dtrain, nrounds = nrounds)
+
+pred <- predict(model, dtest)
+rmse <- sqrt(mean((pred - target[-train_index])^2))
+print(paste("RMSE:", rmse))
+```
+
+
+```{r}
+scoring_matrix <- xgb.DMatrix(data = as.matrix(scoring_data%>%select(-id)))
+predictions <- predict(model, scoring_matrix)
+output_df <- data.frame(id=scoring_data$id, price = predictions)
+write.csv(output_df, "predicted_prices_new_data.csv", row.names = FALSE)
+```
+
+
+```{r, echo=FALSE,warning=FALSE,message=FALSE,error=FALSE, include=FALSE}
+#model agg
+set.seed(385)
+lasso_reg_regression <- function(X1, Y1, X2, Y2, model_specs, XTest, YTest) {
+  #X1，y1 all used for model training
+  X_train <- X1
+  y_train <- Y1
+
+  # Train each model and collect predictions
+  y_hats <- list()
+  models <- c()
+  num_models <- 0
+  
+  for (spec in model_specs) {
+      #random params
+      etas <- sample(c(0.05,0.1,0.3,0.5),size=1)
+      maxdepth <- sample(c(2,3,5,10,20,50,75,100),size=1)
+      print(etas)
+      print(maxdepth)
+      data_matrix <- xgb.DMatrix(data = as.matrix(X_train), label = y_train)
+      params <- list(
+      booster = "gbtree",
+      objective = "reg:squarederror",
+      eta = etas,
+      max_depth = maxdepth,
+      min_child_weight = 1,
+      subsample = 1,
+      colsample_bytree = 1)
+      model <- xgb.train(data = data_matrix, nrounds = 200, params=params, verbose=0)
+      y_hat <- predict(model, as.matrix(X2))
+      print("Training done.")
+      
+      #save current model
+      model_filename <- paste0("model_", num_models + 1, ".model")
+      xgb.save(model, model_filename)
+    
+      num_models <- num_models + 1
+      y_hats <- c(y_hats, list(y_hat))
+  }
+  
+  # Combine predictions for Lasso fitting (call fitting instead of training)
+  y_hats_combined <- data.matrix(do.call(cbind, y_hats))
+  # Fit Lasso model
+  cvs <- glmnet(y_hats_combined, Y2, alpha = 0.25)
+  best_lambda <- cvs$lambda.min
+  best <- glmnet(y_hats_combined, Y2, alpha = 0.25, lambda =  174)
+  print(best)
+  cat("Lasso Coefficients:\n")
+  print(coef(best))
+
+  # on scoring directly
+  test_preds <- list()
+  model_idx <- 0
+  for (spec in model_specs) {
+  
+    m <- paste0("model_", model_idx + 1, ".model")
+    loaded_model <- xgb.load(m)
+    #preds <- predict(loaded_model, as.matrix(scoring_data%>%select(-id)))
+    preds <- predict(loaded_model, as.matrix(XTest))
+
+    model_idx <- model_idx + 1
+    test_preds <- c(test_preds, list(preds))
+  }
+  
+  #need to ensure the test_preds is combined by list of lists
+  final_pred <- predict(best, newx = do.call(cbind, test_preds), lambda = 174)
+  #print(dim(final_pred))
+  #output_df <- data.frame(id=scoring_data$id, price = final_pred)
+  #write.csv(output_df, "predicted_prices_scoring.csv", row.names = FALSE)
+  rmse <- sqrt(mean((YTest - final_pred)^2))
+  print(rmse)
+  return (0)
+}
+
+# Example usage
+X1 = train_data
+Y1 = target[train_index]
+X2 = test_data
+Y2 = target[-train_index]
+XTest = test_data
+YTest = target[-train_index]
+
+model_list <- replicate(25, "xgboost")
+print(model_list)
+result <- invisible(lasso_reg_regression(X1, Y1, X2, Y2, model_list, XTest, YTest))
+result
+```
+
+
+```{r}
+a <- c()
+b <- c(2,3,4)
+a <- c(a, list(b))
+a <- c(a, list(b))
+data.matrix(do.call(cbind, a))
+
+
+```
+
+
+```{r}
+scoring_data
+```
+
